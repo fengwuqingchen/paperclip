@@ -267,8 +267,16 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
     expect([agentB, agentC]).toContain(saved.watchdogAgentId);
   });
 
-  it("does not persist or dispatch an evaluation whose configuration changed during the subtree read", async () => {
+  it.each([false, true])("does not publish a stale evaluation (existing review: %s)", async (existingReview) => {
     const x = await setup("blocked");
+    if (existingReview) {
+      await x.service.reconcileTaskWatchdogs({ companyId: x.companyId });
+      const first = await persisted(x.row.id);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, first.watchdogIssueId!));
+    }
+    const beforeReviews = await db.select().from(issues).where(eq(issues.originId, x.sourceId));
+    const beforeComments = await db.select().from(issueComments);
+    const wakeCount = x.wakes.length;
     const agentB = await seedAgent(x.companyId);
     let changePending = true;
     const intercepted = new Proxy(db, {
@@ -291,9 +299,11 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
     } });
     expect((await service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(0);
     expect((await persisted(x.row.id)).lastObservedFingerprint).toBeNull();
-    expect(x.wakes).toHaveLength(0);
+    expect(x.wakes).toHaveLength(wakeCount);
+    expect(await db.select().from(issues).where(eq(issues.originId, x.sourceId))).toEqual(beforeReviews);
+    expect(await db.select().from(issueComments)).toEqual(beforeComments);
     expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(1);
-    expect(x.wakes).toEqual([agentB]);
+    expect(x.wakes.slice(wakeCount)).toEqual([agentB]);
   });
 
   it("counts concurrent identical saves only once", async () => {
@@ -381,6 +391,61 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
     expect((await persisted(x.row.id)).lastObservedFingerprint).toBeNull();
     expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(1);
     expect(x.wakes).toEqual([agentB]);
+  });
+
+  it.each(["interaction", "approval", "human"] as const)("preserves a pending %s review across configuration changes", async (kind) => {
+    const x = await setup("blocked");
+    await x.service.reconcileTaskWatchdogs({ companyId: x.companyId });
+    const original = await persisted(x.row.id);
+    const reviewId = original.watchdogIssueId!;
+    await db.update(issues).set({ status: "in_review", ...(kind === "human" ? {
+      assigneeAgentId: null, assigneeUserId: "reviewer",
+    } : {}) }).where(eq(issues.id, reviewId));
+    const pendingId = randomUUID();
+    if (kind === "interaction") await db.insert(issueThreadInteractions).values({
+      id: pendingId, companyId: x.companyId, issueId: reviewId,
+      kind: "request_confirmation", status: "pending",
+      payload: { version: 1, prompt: "Confirm the prior review." }, createdByAgentId: x.agentId,
+    });
+    if (kind === "approval") {
+      await db.insert(approvals).values({ id: pendingId, companyId: x.companyId,
+        type: "request_board_approval", status: "pending", payload: { summary: "Approve the review" },
+      });
+      await db.insert(issueApprovals).values({ companyId: x.companyId, issueId: reviewId, approvalId: pendingId });
+    }
+    const newAgent = await seedAgent(x.companyId);
+    await x.service.upsertForIssue(x.companyId, x.sourceId, { agentId: newAgent, instructions: "New criteria" });
+    expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(0);
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review!.status).toBe("in_review");
+    expect(review!.originFingerprint).toBe(original.lastObservedFingerprint);
+    expect(review!.assigneeAgentId).toBe(kind === "human" ? null : x.agentId);
+    expect(review!.assigneeUserId).toBe(kind === "human" ? "reviewer" : null);
+    expect(x.wakes).toHaveLength(1);
+    if (kind === "interaction") {
+      const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, pendingId));
+      expect(pending!.status).toBe("pending");
+      await db.update(issueThreadInteractions).set({ status: "resolved" }).where(eq(issueThreadInteractions.id, pendingId));
+    }
+    if (kind === "approval") {
+      const [pending] = await db.select().from(approvals).where(eq(approvals.id, pendingId));
+      expect(pending!.status).toBe("pending");
+      await db.update(approvals).set({ status: "approved" }).where(eq(approvals.id, pendingId));
+    }
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, reviewId));
+    expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(1);
+    expect((await persisted(x.row.id)).lastReviewedFingerprint).toBeNull();
+    expect(x.wakes).toEqual([x.agentId, newAgent]);
+  });
+
+  it("finishes concurrent evaluations without re-entering an exhausted connection pool", async () => {
+    const x = await setup("blocked");
+    const results = await Promise.all(Array.from({ length: 12 }, () =>
+      x.service.reconcileTaskWatchdogs({ companyId: x.companyId })));
+    expect(results.reduce((sum, result) => sum + result.triggered, 0)).toBe(1);
+    expect(await db.select().from(issues).where(eq(issues.originId, x.sourceId))).toHaveLength(1);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(x.wakes).toHaveLength(1);
   });
 
 });
