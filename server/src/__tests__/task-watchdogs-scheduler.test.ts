@@ -412,7 +412,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       contextSnapshot: { issueId: omittedId },
     });
     expect(await x.service.reconcileTaskWatchdogs({ companyId: x.companyId }))
-      .toMatchObject({ checked: 1, triggered: 0, skipped: 1 });
+      .toMatchObject({ checked: 1, triggered: 0, incomplete: 1, incompleteIssueIds: [x.sourceId], skipped: 0 });
     expect(x.wakes).toHaveLength(0);
     const [persisted] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, x.watchdog.id));
     expect(persisted!.watchdogIssueId).toBeNull();
@@ -439,7 +439,8 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(incomplete.allowed).toBe(false);
     expect(incomplete.classification?.state).toBe("incomplete");
     expect(incomplete.reason).toContain("incomplete");
-    expect((await x.service.reconcileForIssueAndAncestors(x.companyId, x.sourceId)).triggered).toBe(0);
+    expect(await x.service.reconcileForIssueAndAncestors(x.companyId, x.sourceId))
+      .toMatchObject({ triggered: 0, incomplete: 1, incompleteIssueIds: [x.sourceId], skipped: 0 });
     expect(x.wakes).toHaveLength(1);
     await db.update(issues).set({ parentId: x.sourceId }).where(eq(issues.id, omittedId));
     const visible = await x.service.revalidateMutationScope(scope);

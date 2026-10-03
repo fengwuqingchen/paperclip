@@ -1561,6 +1561,12 @@ async function startServerWithDatabaseTeardown(
         }
 
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+        if (taskWatchdogsReconciled.incomplete > 0) {
+          logger.warn(
+            { ...taskWatchdogsReconciled },
+            "startup task-watchdog reconciliation found incomplete subtree scans",
+          );
+        }
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
             { ...taskWatchdogsReconciled },
@@ -1803,6 +1809,9 @@ async function startServerWithDatabaseTeardown(
             })
             .then(async () => {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
+              if (reconciled.incomplete > 0) {
+                logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation found incomplete subtree scans");
+              }
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
               }

@@ -1782,6 +1782,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         live: 0,
         pendingFirstRun: 0,
         alreadyReviewed: 0,
+        incomplete: 0,
+        incompleteIssueIds: [] as string[],
         skipped: 0,
         watchdogIssueIds: [] as string[],
       };
@@ -1801,6 +1803,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.pendingFirstRun += 1;
         } else if (evaluated.state === "already_reviewed") {
           result.alreadyReviewed += 1;
+        } else if (evaluated.state === "incomplete") {
+          result.incomplete += 1;
+          result.incompleteIssueIds.push(row.issueId);
         } else {
           result.skipped += 1;
         }
@@ -1818,6 +1823,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         checked: 0,
         triggered: 0,
         pendingFirstRun: 0,
+        incomplete: 0,
+        incompleteIssueIds: [] as string[],
         skipped: 0,
         watchdogIssueIds: [] as string[],
       };
@@ -1829,6 +1836,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.watchdogIssueIds.push(evaluated.watchdogIssueId);
         } else if (evaluated.state === "pending_first_run") {
           result.pendingFirstRun += 1;
+        } else if (evaluated.state === "incomplete") {
+          result.incomplete += 1;
+          result.incompleteIssueIds.push(row.issueId);
         } else if (
           evaluated.state === "watchdog_review_open" ||
           evaluated.state === "watchdog_live" ||
