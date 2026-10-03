@@ -215,7 +215,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
-  heartbeatService,
+  heartbeatService as createHeartbeatService,
   parseSandboxProviderPluginNotReadyFailureMessage,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
@@ -455,6 +455,29 @@ async function spawnOrphanedProcessGroup() {
   };
 }
 
+// Keep the ordinary fixture pool warm. Only a service lifetime that actually
+// shuts down needs a new Db; the shutdown hold itself must never be reset.
+const shutdownFixtureDbs = new WeakSet<ReturnType<typeof createDb>>();
+function heartbeatService(...args: Parameters<typeof createHeartbeatService>) {
+  const service = createHeartbeatService(...args);
+  const fixtureDb = args[0];
+  return {
+    ...service,
+    closeRunAdmissionForShutdown() {
+      shutdownFixtureDbs.add(fixtureDb);
+      service.closeRunAdmissionForShutdown();
+    },
+    prepareHotRestartShutdown(...params: Parameters<typeof service.prepareHotRestartShutdown>) {
+      shutdownFixtureDbs.add(fixtureDb);
+      return service.prepareHotRestartShutdown(...params);
+    },
+    drainRunningRunsForShutdown(...params: Parameters<typeof service.drainRunningRunsForShutdown>) {
+      shutdownFixtureDbs.add(fixtureDb);
+      return service.drainRunningRunsForShutdown(...params);
+    },
+  };
+}
+
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
@@ -652,11 +675,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
-    // A shutdown closes the server's Db lifetime permanently. Each case
-    // represents a new server lifetime, even though it reuses the fixture DB.
-    const connectionString = externalTestDatabaseUrl ?? tempDb!.connectionString;
-    await closeRegisteredClients(connectionString);
-    db = createDb(connectionString);
+    if (shutdownFixtureDbs.has(db)) {
+      const connectionString = externalTestDatabaseUrl ?? tempDb!.connectionString;
+      await closeRegisteredClients(connectionString);
+      db = createDb(connectionString);
+    }
   });
 
   afterAll(async () => {
