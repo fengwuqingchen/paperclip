@@ -1324,6 +1324,7 @@ const activeWakeupPromises = new Set<Promise<unknown>>();
 // Closing admission belongs to that server lifetime, not to one service. A new
 // server creates a new Db; no operator action can reopen a closing lifetime.
 const shutdownDatabases = new WeakSet<Db>();
+class ShutdownAdmissionClosedError extends Error {}
 const nativeSessionResumeDispatchTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
@@ -20341,6 +20342,7 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
+    let shutdownClaimReleasePending = false;
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -22765,11 +22767,28 @@ export function heartbeatService(
           },
         );
       }
+      const assertShutdownAdmissionOpen = () => {
+        if (!shutdownDatabases.has(db)) return;
+        // Selected native state can retain a runner from an earlier turn.
+        // Preserve its existing restart ownership path instead of requeueing it
+        // on the assumption that no managed process exists.
+        if (nativeRuntimeResolution.kind === "native") {
+          throw new NativeControllerDetachedForRestartError();
+        }
+        throw new ShutdownAdmissionClosedError();
+      };
       const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
         dispatch: (markDispatchStarted: () => void) => Promise<T>,
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
+        assertShutdownAdmissionOpen();
+        const dispatchIfOpen = (markDispatchStarted: () => void) => {
+          // This check and handoff are synchronous, including when the
+          // continuation gate has just awaited its database ownership lock.
+          assertShutdownAdmissionOpen();
+          return dispatch(markDispatchStarted);
+        };
         await controllerLease.assertOwned("dispatching");
         // Recheck after workspace/credential preparation, immediately before the
         // provider handoff. Never hold validation locks while adapter code runs.
@@ -22803,7 +22822,7 @@ export function heartbeatService(
           (!isResolvedInteractionContinuationWakeContext(context) &&
             run.scheduledRetryReason !== "native_safe_replacement")
         ) {
-          return { dispatched: true, resultPromise: dispatch(() => {}) };
+          return { dispatched: true, resultPromise: dispatchIfOpen(() => {}) };
         }
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
           runId: run.id,
@@ -22820,7 +22839,7 @@ export function heartbeatService(
           expectedStatus: "running",
           // Synchronous handoff under the ownership lock; the gate commits
           // without awaiting the adapter's asynchronous bootstrap or finalizer.
-          dispatch,
+          dispatch: dispatchIfOpen,
         });
 
         if (gate.dispatched) return gate;
@@ -24956,8 +24975,10 @@ export function heartbeatService(
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
-                  legacyAdapterEntered = true;
-                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => {
+                    assertShutdownAdmissionOpen();
+                    legacyAdapterEntered = true;
+                    return adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
                     agent,
@@ -25033,7 +25054,8 @@ export function heartbeatService(
                       });
                     },
                     authToken: authToken ?? undefined,
-                  }));
+                  });
+                  });
                 },
               );
             if (!guardedDispatch.dispatched) return;
@@ -25995,6 +26017,11 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        if (err instanceof ShutdownAdmissionClosedError) {
+          // Retain the claim until preparation resources finish cleanup below.
+          shutdownClaimReleasePending = true;
+          return;
+        }
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;
@@ -26625,12 +26652,15 @@ export function heartbeatService(
         // Close the invariant "environment lease released implies the run is
         // terminal". When the teardown reaches this point with the run still
         // running or queued, force a terminal status before the lease is
-        // released, so the UI never shows a finished task as "Live".
+        // released, so the UI never shows a finished task as "Live". A shutdown
+        // deferral has not entered the provider; it keeps its claim through
+        // cleanup and returns to the durable queue afterward.
         if (
           latestRun &&
           !nativeSessionResumeScheduled &&
           !nativeWorkspaceFinalizeScheduled &&
-          !nativeOwnershipHeld
+          !nativeOwnershipHeld &&
+          !shutdownClaimReleasePending
         ) {
           latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch(
             (terminalizeErr) => {
@@ -26663,7 +26693,7 @@ export function heartbeatService(
           if (
             githubLauncherLocation &&
             latestRun &&
-            isHeartbeatRunTerminalStatus(latestRun.status)
+            (isHeartbeatRunTerminalStatus(latestRun.status) || shutdownClaimReleasePending)
           ) {
             await cleanupGitHubOperationLaunchers(githubLauncherLocation).catch(
               (err) => {
@@ -26697,7 +26727,7 @@ export function heartbeatService(
         if (
           runScratch &&
           latestRun &&
-          isHeartbeatRunTerminalStatus(latestRun.status)
+          (isHeartbeatRunTerminalStatus(latestRun.status) || (shutdownClaimReleasePending && !nativeOwnershipHeld))
         ) {
           const scratchForCleanup = runScratch;
           let scratchCleanup: Awaited<
@@ -26783,6 +26813,13 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
+      if (shutdownClaimReleasePending && !nativeOwnershipHeld) {
+        await releaseRunClaimedJustBeforeSuppression(run.id);
+        await db.update(agents).set({ status: "idle", updatedAt: new Date() }).where(and(
+          eq(agents.id, run.agentId), eq(agents.companyId, run.companyId), eq(agents.status, "running"),
+          sql`not exists (select 1 from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${run.agentId} and ${heartbeatRuns.status} = 'running')`,
+        ));
+      }
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),

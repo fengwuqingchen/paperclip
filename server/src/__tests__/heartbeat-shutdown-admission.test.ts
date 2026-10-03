@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -235,4 +235,67 @@ describeEmbeddedPostgres("heartbeat shutdown admission", () => {
       suppressed: true, reason: "database_restore_in_progress",
     });
   });
+  it("does not launch a child when shutdown starts during asynchronous preparation", async () => {
+    const { agentId, issueId } = await seedAgentAndIssue();
+    const folder = await mkdtemp(path.join(tmpdir(), "shutdown-preparation-child-"));
+    const marker = path.join(folder, "started");
+    await db.update(agents).set({ adapterConfig: {
+      command: process.execPath,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+    } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    let unlock!: () => void;
+    let ready!: () => void;
+    const release = new Promise<void>((resolve) => { unlock = resolve; });
+    const locked = new Promise<void>((resolve) => { ready = resolve; });
+    const preparation = db.transaction(async (tx) => {
+      await tx.execute(sql`lock table company_skills in access exclusive mode`);
+      ready();
+      await release;
+    });
+    let wake: Promise<unknown> | null = null;
+    try {
+      await locked;
+      wake = heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId }, contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        requestedByActorType: "system", requestedByActorId: "issue_assignment",
+      });
+      let blocked = false;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const rows = await db.execute(sql`select exists (
+          select 1 from pg_stat_activity where datname = current_database()
+          and wait_event_type = 'Lock' and query ilike '%company_skills%'
+          and pid <> pg_backend_pid()
+        ) as blocked`);
+        if (rows[0]?.blocked === true) { blocked = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+      const [preparing] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(preparing.status).toBe("running");
+      heartbeat.closeRunAdmissionForShutdown();
+      unlock();
+      await preparation;
+      await wake;
+      await heartbeat.drainActiveRunExecutions();
+      expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, preparing.id));
+      expect(run).toMatchObject({ status: "queued", startedAt: null, responsibleUserId: null });
+      const [request] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, run.wakeupRequestId!));
+      expect(request).toMatchObject({ status: "queued", claimedAt: null });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue.executionRunId).toBeNull();
+      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      expect(agent.status).toBe("idle");
+    } finally {
+      unlock();
+      await preparation;
+      await wake;
+      await heartbeat.drainActiveRunExecutions();
+      await rm(folder, { recursive: true, force: true });
+    }
+  }, 20_000);
+
 });
