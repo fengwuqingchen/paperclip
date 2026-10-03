@@ -50,16 +50,12 @@ describe("task watchdog subtree classifier", () => {
     });
   });
 
-  it.each(["execution_recovery", "process_identity_missing"])(
-    "does not count a deferred wake waiting on %s as live work",
-    (executionWaitReason) => {
-      const result = classify({
-        issues: [issue({ status: "blocked" })],
-        queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution", executionWaitReason }],
-      });
-      expect(result.state).toBe("stopped");
-    },
-  );
+  it("keeps a deferred wake live without a current execution blocker", () => {
+    expect(classify({
+      issues: [issue({ status: "blocked" })],
+      queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution" }],
+    })).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+  });
 
   it("does not count a deferred wake behind a current execution blocker as live", () => {
     const result = classify({
@@ -74,7 +70,7 @@ describe("task watchdog subtree classifier", () => {
     "keeps an ordinary %s wake live",
     (status) => {
       expect(classify({
-        queuedWakeRequests: [{ companyId, issueId: sourceId, status, executionWaitReason: "issue_execution_locked" }],
+        queuedWakeRequests: [{ companyId, issueId: sourceId, status }],
       })).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
     },
   );
@@ -83,7 +79,7 @@ describe("task watchdog subtree classifier", () => {
     expect(classify({
       executionBlockedIssueIds: [sourceId],
       activeRuns: [{ companyId, issueId: sourceId, status: "running" }],
-      queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution", executionWaitReason: "execution_recovery" }],
+      queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution" }],
     })).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
   });
 

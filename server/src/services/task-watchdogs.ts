@@ -19,7 +19,7 @@ import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
-import { getExecutionBlocker } from "./execution-blocker.js";
+import { getExecutionBlockedIssueIds } from "./execution-blocker.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -78,7 +78,6 @@ export type TaskWatchdogClassifierIssue = Pick<
 };
 
 export type TaskWatchdogClassifierPath = {
-  executionWaitReason?: string | null;
   companyId: string;
   issueId: string | null;
   agentId?: string | null;
@@ -416,9 +415,7 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     if (wake.status !== "deferred_issue_execution") return true;
     // A saved wake behind an execution recovery/stop-proof gate cannot
     // advance this subtree by itself. It must not silence its watchdog.
-    return !executionBlockedIssueIds.has(wake.issueId ?? "") &&
-      wake.executionWaitReason !== "execution_recovery" &&
-      wake.executionWaitReason !== "process_identity_missing";
+    return !executionBlockedIssueIds.has(wake.issueId ?? "");
   });
   const liveIssueIds = [
     ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
@@ -1086,19 +1083,14 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .groupBy(issueWorkProducts.issueId),
     ]);
-    // Reuse the admission predicate, including resolved no-replay holds and
-    // conversation boundaries. Query each deferred issue only once and bound
-    // concurrent lookups; ordinary queued wakes require no extra reads.
+    // Only current admission holds suppress liveness. Saved wait reasons can
+    // outlive their hold; bulk reads avoid per-issue presentation queries.
+    const subtreeIssueIdSet = new Set(subtreeIssueIds);
     const deferredIssueIds = [...new Set(wakeRows
       .filter((row) => row.status === "deferred_issue_execution")
       .map((row) => issueIdFromWakePayload(row.payload))
-      .filter((issueId): issueId is string => Boolean(issueId)))];
-    const executionBlockedIssueIds: string[] = [];
-    for (let offset = 0; offset < deferredIssueIds.length; offset += 8) {
-      const blocked = await Promise.all(deferredIssueIds.slice(offset, offset + 8).map(async (issueId) =>
-        await getExecutionBlocker(db, companyId, issueId) ? issueId : null));
-      executionBlockedIssueIds.push(...blocked.filter((issueId): issueId is string => issueId !== null));
-    }
+      .filter((issueId): issueId is string => Boolean(issueId && subtreeIssueIdSet.has(issueId))))];
+    const executionBlockedIssueIds = await getExecutionBlockedIssueIds(db, companyId, deferredIssueIds);
     const latestCommentByIssueId = new Map(commentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestDocumentByIssueId = new Map(documentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestWorkProductByIssueId = new Map(workProductActivityRows.map((row) => [row.issueId, row.latestAt]));
@@ -1139,9 +1131,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
-        executionWaitReason: typeof parseObject(row.payload?.executionWait).reason === "string"
-          ? parseObject(row.payload?.executionWait).reason as string
-          : null,
       })),
       executionBlockedIssueIds,
       blockers: blockerRows,

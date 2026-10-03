@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -23,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { getExecutionBlocker, getExecutionBlockedIssueIds } from "../services/execution-blocker.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -372,7 +373,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     }).returning();
     await db.insert(agentWakeupRequests).values({
       companyId, agentId, status: "deferred_issue_execution", source: "on_demand",
-      triggerDetail: "manual", reason: "issue_comment", payload: { issueId: childId },
+      triggerDetail: "manual", reason: "issue_comment", payload: { issueId: childId, executionWait: { reason: "execution_recovery" } },
     });
     const { service, wakes } = createService();
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1, live: 0 });
@@ -381,14 +382,14 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(wakes).toHaveLength(1);
     const [unchangedHold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
     expect(unchangedHold?.evidence).toEqual({ automaticRecovery: { replay: "blocked" } });
-    // Once the actual hold clears, an ordinary deferred wake is a live path again.
+    // Once the hold clears, its saved wait reason must not hide eligible work.
     await db.update(issueRecoveryActions).set({ evidence: { automaticRecovery: { replay: "allowed" } } })
       .where(eq(issueRecoveryActions.id, hold!.id));
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ live: 1, triggered: 0 });
   });
 
   it.each(["execution_recovery", "process_identity_missing"])(
-    "triggers for a deferred wake carrying an %s execution wait",
+    "keeps a deferred wake with a stale %s reason live without a current hold",
     async (reason) => {
       const companyId = await seedCompany();
       const sourceId = await seedIssue(companyId, { status: "blocked" });
@@ -399,10 +400,77 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
         payload: { issueId: sourceId, executionWait: { reason } },
       });
       const { service, wakes } = createService();
-      expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1, live: 0 });
-      expect(wakes).toHaveLength(1);
+      expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 0, live: 1 });
+      expect(wakes).toHaveLength(0);
     },
   );
+
+  it("bulk checks current holds with constant reads and preserves conversation boundaries", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const ids = await Promise.all(Array.from({ length: 24 }, () => seedIssue(companyId)));
+    const foreignId = await seedIssue(otherCompanyId);
+    await db.insert(issueRecoveryActions).values([...ids, foreignId].map((sourceIssueId) => ({
+      companyId: sourceIssueId === foreignId ? otherCompanyId : companyId,
+      sourceIssueId, kind: "active_run_watchdog", status: "resolved", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: sourceIssueId,
+      evidence: { automaticRecovery: { replay: "blocked" } }, nextAction: "Inspect the execution.",
+      createdAt: new Date(Date.now() - 60_000),
+    })));
+    const [boundary] = await db.insert(issueComments).values({
+      companyId, issueId: ids[0]!, authorType: "user", authorUserId: "board", body: "/new",
+    }).returning();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: agentId, conversationUserId: "board", conversationState: "active", conversationAgentId: agentId, conversationBoundaryCommentId: boundary!.id })
+      .where(eq(issues.id, ids[0]!));
+    const [unsafeBoundary] = await db.insert(issueComments).values({
+      companyId, issueId: ids[1]!, authorType: "user", authorUserId: "board", body: "/new",
+    }).returning();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: agentId, conversationUserId: "other-board-user", conversationState: "active", conversationAgentId: agentId, conversationBoundaryCommentId: unsafeBoundary!.id })
+      .where(eq(issues.id, ids[1]!));
+    await db.update(issueRecoveryActions).set({ evidence: {
+      automaticRecovery: { replay: "blocked" }, workspaceRestoreFailure: "restore_unsafe_archive",
+    } }).where(eq(issueRecoveryActions.sourceIssueId, ids[1]!));
+    const select = vi.spyOn(db, "select");
+    let blocked: string[];
+    try {
+      blocked = await getExecutionBlockedIssueIds(db, companyId, [...ids, foreignId]);
+      expect(select).toHaveBeenCalledTimes(2);
+    } finally { select.mockRestore(); }
+    expect(blocked!).toHaveLength(23);
+    expect(blocked!).not.toContain(ids[0]);
+    expect(blocked!).not.toContain(foreignId);
+    expect(blocked!).toContain(ids[1]);
+    expect(await getExecutionBlocker(db, companyId, ids[0]!)).toBeNull();
+    expect(await getExecutionBlocker(db, companyId, ids[1]!)).not.toBeNull();
+    expect(await getExecutionBlocker(db, companyId, ids[2]!)).not.toBeNull();
+  });
+
+  it("bulk checks keep terminal conversation ownership scoped to its issue", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const ownedId = await seedIssue(companyId);
+    const stoppedId = await seedIssue(companyId);
+    const [ownedRun] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, runtimeMode: "legacy", status: "interrupted", invocationSource: "assignment",
+      contextSnapshot: { issueId: ownedId }, processPid: process.pid,
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+    }).returning();
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, runtimeMode: "legacy", status: "interrupted", invocationSource: "assignment",
+      contextSnapshot: { issueId: stoppedId }, processPid: 2147483647,
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+    });
+    expect(await getExecutionBlockedIssueIds(db, companyId, [ownedId, stoppedId])).toEqual([ownedId]);
+    expect(await getExecutionBlocker(db, companyId, ownedId)).toMatchObject({ cause: "execution_owner_active" });
+    await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, ownedRun!.id));
+    expect(await getExecutionBlockedIssueIds(db, companyId, [ownedId, stoppedId])).toEqual([]);
+    const select = vi.spyOn(db, "select");
+    try {
+      expect(await getExecutionBlockedIssueIds(db, companyId, [])).toEqual([]);
+      expect(select).not.toHaveBeenCalled();
+    } finally { select.mockRestore(); }
+  });
 
   it("does not keep the source live for runs under a nested task-watchdog issue", async () => {
     const companyId = await seedCompany();
