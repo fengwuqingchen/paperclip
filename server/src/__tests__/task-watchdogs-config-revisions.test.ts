@@ -393,7 +393,9 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
     expect(x.wakes).toEqual([agentB]);
   });
 
-  it.each(["interaction", "approval", "human"] as const)("preserves a pending %s review across configuration changes", async (kind) => {
+  it.each((["interaction", "approval", "human"] as const).flatMap((kind) =>
+    (["configuration", "subtree"] as const).map((change) => ({ kind, change }))))(
+    "preserves a pending $kind review across $change changes", async ({ kind, change }) => {
     const x = await setup("blocked");
     await x.service.reconcileTaskWatchdogs({ companyId: x.companyId });
     const original = await persisted(x.row.id);
@@ -413,8 +415,13 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
       });
       await db.insert(issueApprovals).values({ companyId: x.companyId, issueId: reviewId, approvalId: pendingId });
     }
-    const newAgent = await seedAgent(x.companyId);
-    await x.service.upsertForIssue(x.companyId, x.sourceId, { agentId: newAgent, instructions: "New criteria" });
+    const newAgent = change === "configuration" ? await seedAgent(x.companyId) : x.agentId;
+    if (change === "configuration") {
+      await x.service.upsertForIssue(x.companyId, x.sourceId, { agentId: newAgent, instructions: "New criteria" });
+    } else {
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, x.sourceId));
+      expect((await x.service.revalidateMutationScope(await scope(x))).allowed).toBe(false);
+    }
     expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(0);
     const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
     expect(review!.status).toBe("in_review");
@@ -434,7 +441,9 @@ describeEmbeddedPostgres("task watchdog configuration revisions", () => {
     }
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, reviewId));
     expect((await x.service.reconcileTaskWatchdogs({ companyId: x.companyId })).triggered).toBe(1);
-    expect((await persisted(x.row.id)).lastReviewedFingerprint).toBeNull();
+    expect((await persisted(x.row.id)).lastReviewedFingerprint).toBe(
+      change === "configuration" ? null : original.lastObservedFingerprint,
+    );
     expect(x.wakes).toEqual([x.agentId, newAgent]);
   });
 

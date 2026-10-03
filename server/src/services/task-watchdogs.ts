@@ -1531,7 +1531,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         .then((rows) => rows[0] ?? null)
       : null;
     if (existingWatchdogIssue?.status === "in_review" &&
-      fingerprintConfigurationRevision(existingWatchdogIssue.originFingerprint ?? "") !== watchdog.configurationRevision &&
       isWatchdogReviewDisposition(
       existingWatchdogIssue,
       await watchdogIssueHasPendingReviewPath(watchdog.companyId, existingWatchdogIssue.id),
@@ -1580,7 +1579,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         return { state: "watchdog_live" as const, watchdogIssueId: review.id };
       }
       if (review?.status === "in_review" &&
-        fingerprintConfigurationRevision(review.originFingerprint ?? "") !== watchdog.configurationRevision &&
         isWatchdogReviewDisposition(
         review, await watchdogIssueHasPendingReviewPath(watchdog.companyId, review.id, tx),
       )) {
