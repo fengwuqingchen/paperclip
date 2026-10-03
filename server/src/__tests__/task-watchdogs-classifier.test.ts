@@ -50,6 +50,43 @@ describe("task watchdog subtree classifier", () => {
     });
   });
 
+  it.each(["execution_recovery", "process_identity_missing"])(
+    "does not count a deferred wake waiting on %s as live work",
+    (executionWaitReason) => {
+      const result = classify({
+        issues: [issue({ status: "blocked" })],
+        queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution", executionWaitReason }],
+      });
+      expect(result.state).toBe("stopped");
+    },
+  );
+
+  it("does not count a deferred wake behind a current execution blocker as live", () => {
+    const result = classify({
+      issues: [issue({ status: "blocked" })],
+      executionBlockedIssueIds: [sourceId],
+      queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution" }],
+    });
+    expect(result.state).toBe("stopped");
+  });
+
+  it.each(["queued", "deferred_issue_execution"])(
+    "keeps an ordinary %s wake live",
+    (status) => {
+      expect(classify({
+        queuedWakeRequests: [{ companyId, issueId: sourceId, status, executionWaitReason: "issue_execution_locked" }],
+      })).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+    },
+  );
+
+  it("keeps real running work live even when a deferred wake is held", () => {
+    expect(classify({
+      executionBlockedIssueIds: [sourceId],
+      activeRuns: [{ companyId, issueId: sourceId, status: "running" }],
+      queuedWakeRequests: [{ companyId, issueId: sourceId, status: "deferred_issue_execution", executionWaitReason: "execution_recovery" }],
+    })).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+  });
+
   it("treats terminal and waiting leaves as stopped work that needs verification", () => {
     const result = classify({
       issues: [

@@ -11,6 +11,7 @@ import {
   documents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueDocuments,
   issueApprovals,
   issueThreadInteractions,
@@ -54,6 +55,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueWatchdogs);
+    await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -356,6 +358,51 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
     expect(watchdogIssues).toHaveLength(0);
   });
+
+  it("triggers once for a deferred wake behind a resolved no-replay hold", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { status: "done" });
+    const childId = await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: childId, kind: "active_run_watchdog", status: "resolved",
+      ownerType: "board", cause: "legacy_execution_requires_reconciliation", fingerprint: "held-child",
+      evidence: { automaticRecovery: { replay: "blocked" } }, nextAction: "Inspect the stopped execution.",
+    }).returning();
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, status: "deferred_issue_execution", source: "on_demand",
+      triggerDetail: "manual", reason: "issue_comment", payload: { issueId: childId },
+    });
+    const { service, wakes } = createService();
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1, live: 0 });
+    expect(wakes).toHaveLength(1);
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 0 });
+    expect(wakes).toHaveLength(1);
+    const [unchangedHold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
+    expect(unchangedHold?.evidence).toEqual({ automaticRecovery: { replay: "blocked" } });
+    // Once the actual hold clears, an ordinary deferred wake is a live path again.
+    await db.update(issueRecoveryActions).set({ evidence: { automaticRecovery: { replay: "allowed" } } })
+      .where(eq(issueRecoveryActions.id, hold!.id));
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ live: 1, triggered: 0 });
+  });
+
+  it.each(["execution_recovery", "process_identity_missing"])(
+    "triggers for a deferred wake carrying an %s execution wait",
+    async (reason) => {
+      const companyId = await seedCompany();
+      const sourceId = await seedIssue(companyId, { status: "blocked" });
+      const agentId = await seedAgent(companyId);
+      await seedWatchdog(companyId, sourceId, agentId);
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, status: "deferred_issue_execution", source: "on_demand", triggerDetail: "manual",
+        payload: { issueId: sourceId, executionWait: { reason } },
+      });
+      const { service, wakes } = createService();
+      expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1, live: 0 });
+      expect(wakes).toHaveLength(1);
+    },
+  );
 
   it("does not keep the source live for runs under a nested task-watchdog issue", async () => {
     const companyId = await seedCompany();

@@ -19,6 +19,7 @@ import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -77,6 +78,7 @@ export type TaskWatchdogClassifierIssue = Pick<
 };
 
 export type TaskWatchdogClassifierPath = {
+  executionWaitReason?: string | null;
   companyId: string;
   issueId: string | null;
   agentId?: string | null;
@@ -190,6 +192,7 @@ export type TaskWatchdogClassifierInput = {
   issues: TaskWatchdogClassifierIssue[];
   activeRuns?: TaskWatchdogClassifierPath[];
   queuedWakeRequests?: TaskWatchdogClassifierPath[];
+  executionBlockedIssueIds?: string[];
   blockers?: TaskWatchdogClassifierRelation[];
   pendingInteractions?: TaskWatchdogClassifierWaitingPath[];
   pendingApprovals?: TaskWatchdogClassifierWaitingPath[];
@@ -408,9 +411,18 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
+  const executionBlockedIssueIds = new Set(input.executionBlockedIssueIds ?? []);
+  const liveWakeRequests = input.queuedWakeRequests?.filter((wake) => {
+    if (wake.status !== "deferred_issue_execution") return true;
+    // A saved wake behind an execution recovery/stop-proof gate cannot
+    // advance this subtree by itself. It must not silence its watchdog.
+    return !executionBlockedIssueIds.has(wake.issueId ?? "") &&
+      wake.executionWaitReason !== "execution_recovery" &&
+      wake.executionWaitReason !== "process_identity_missing";
+  });
   const liveIssueIds = [
     ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
-    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...pathIssueIds(liveWakeRequests, input.watchdog.companyId),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
@@ -1074,6 +1086,19 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .groupBy(issueWorkProducts.issueId),
     ]);
+    // Reuse the admission predicate, including resolved no-replay holds and
+    // conversation boundaries. Query each deferred issue only once and bound
+    // concurrent lookups; ordinary queued wakes require no extra reads.
+    const deferredIssueIds = [...new Set(wakeRows
+      .filter((row) => row.status === "deferred_issue_execution")
+      .map((row) => issueIdFromWakePayload(row.payload))
+      .filter((issueId): issueId is string => Boolean(issueId)))];
+    const executionBlockedIssueIds: string[] = [];
+    for (let offset = 0; offset < deferredIssueIds.length; offset += 8) {
+      const blocked = await Promise.all(deferredIssueIds.slice(offset, offset + 8).map(async (issueId) =>
+        await getExecutionBlocker(db, companyId, issueId) ? issueId : null));
+      executionBlockedIssueIds.push(...blocked.filter((issueId): issueId is string => issueId !== null));
+    }
     const latestCommentByIssueId = new Map(commentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestDocumentByIssueId = new Map(documentActivityRows.map((row) => [row.issueId, row.latestAt]));
     const latestWorkProductByIssueId = new Map(workProductActivityRows.map((row) => [row.issueId, row.latestAt]));
@@ -1114,7 +1139,11 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
+        executionWaitReason: typeof parseObject(row.payload?.executionWait).reason === "string"
+          ? parseObject(row.payload?.executionWait).reason as string
+          : null,
       })),
+      executionBlockedIssueIds,
       blockers: blockerRows,
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
