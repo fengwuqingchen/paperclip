@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { classifyTaskWatchdogSubtree, createIncompleteTaskWatchdogScanReporter, type TaskWatchdogClassifierIssue } from "../services/task-watchdogs.ts";
+import { classifyTaskWatchdogSubtree, type TaskWatchdogClassifierIssue } from "../services/task-watchdogs.ts";
+
+import { createIncompleteTaskWatchdogScanReporter } from "../services/task-watchdog-diagnostics.ts";
 
 const companyId = "company-1";
 const sourceId = "source-1";

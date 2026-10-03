@@ -39,22 +39,6 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // re-evaluates after the window, so a genuinely idle issue still triggers.
 const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
 
-export function createIncompleteTaskWatchdogScanReporter(
-  warn: (details: { incomplete: number; newIncompleteIssueIds: string[] }, message: string) => void,
-) {
-  let previousIncompleteIssueIds = new Set<string>();
-  return (result: { incomplete: number; incompleteIssueIds: string[] }, phase: "startup" | "periodic") => {
-    const currentIssueIds = new Set(result.incompleteIssueIds);
-    const newIncompleteIssueIds = [...currentIssueIds].filter((id) => !previousIncompleteIssueIds.has(id));
-    previousIncompleteIssueIds = currentIssueIds;
-    if (newIncompleteIssueIds.length === 0) return;
-    warn(
-      { incomplete: result.incomplete, newIncompleteIssueIds },
-      `${phase} task-watchdog reconciliation found incomplete subtree scans`,
-    );
-  };
-}
-
 type ActorFields = {
   agentId?: string | null;
   userId?: string | null;
