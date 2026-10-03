@@ -22767,26 +22767,27 @@ export function heartbeatService(
           },
         );
       }
-      const assertShutdownAdmissionOpen = () => {
+      const assertShutdownAdmissionOpen = (runtimeMode: "legacy" | "native") => {
         if (!shutdownDatabases.has(db)) return;
         // Selected native state can retain a runner from an earlier turn.
         // Preserve its existing restart ownership path instead of requeueing it
         // on the assumption that no managed process exists.
-        if (nativeRuntimeResolution.kind === "native") {
+        if (runtimeMode === "native") {
           throw new NativeControllerDetachedForRestartError();
         }
         throw new ShutdownAdmissionClosedError();
       };
       const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
+        runtimeMode: "legacy" | "native",
         dispatch: (markDispatchStarted: () => void) => Promise<T>,
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
-        assertShutdownAdmissionOpen();
+        assertShutdownAdmissionOpen(runtimeMode);
         const dispatchIfOpen = (markDispatchStarted: () => void) => {
           // This check and handoff are synchronous, including when the
           // continuation gate has just awaited its database ownership lock.
-          assertShutdownAdmissionOpen();
+          assertShutdownAdmissionOpen(runtimeMode);
           return dispatch(markDispatchStarted);
         };
         await controllerLease.assertOwned("dispatching");
@@ -24751,6 +24752,7 @@ export function heartbeatService(
             );
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
+                "native",
                 (markDispatchStarted) =>
                   executePaperclipNativeSession({
                     db,
@@ -24974,9 +24976,10 @@ export function heartbeatService(
             }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
+                "legacy",
                 (markDispatchStarted) => {
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => {
-                    assertShutdownAdmissionOpen();
+                    assertShutdownAdmissionOpen("legacy");
                     legacyAdapterEntered = true;
                     return adapter.execute({
                     getFreshSessionHandoff,
