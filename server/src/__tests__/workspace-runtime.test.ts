@@ -1197,11 +1197,7 @@ describe("realizeExecutionWorkspace", () => {
       expect(existsSync(path.resolve(initial.cwd, indexLock))).toBe(true);
       // Let the competing reset reach the held native index before release.
       await new Promise((resolve) => setTimeout(resolve, 500));
-    } finally {
       await fs.writeFile(release, "release\n");
-      await firstResult;
-    }
-    try {
       for (const result of [await firstResult, await secondResult]) {
         if (result && typeof result === "object" && "error" in result) throw result.error;
         expect(result).toHaveProperty("value");
@@ -1211,6 +1207,9 @@ describe("realizeExecutionWorkspace", () => {
       expect(resets).toHaveLength(1);
       expect(resets[0]?.result.status).toBe("succeeded");
     } finally {
+      await fs.writeFile(release, "release\n");
+      await firstResult;
+      await secondResult;
       await fs.rm(gateDir, { recursive: true, force: true });
     }
   });
