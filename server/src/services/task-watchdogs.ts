@@ -1255,12 +1255,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   async function sameFingerprintWatchdogReviewIsStillOpen(
     watchdogIssue: IssueRow | null,
     stopFingerprint: string,
+    dbOrTx: Db | DbTransaction = db,
   ) {
     if (!watchdogIssue) return false;
     if (watchdogIssue.originFingerprint !== stopFingerprint) return false;
     if (isTerminalIssueStatus(watchdogIssue.status) || watchdogIssue.status === "backlog") return false;
     if (watchdogIssue.status === "in_review") {
-      const hasPendingReviewPath = await watchdogIssueHasPendingReviewPath(watchdogIssue.companyId, watchdogIssue.id);
+      const hasPendingReviewPath = await watchdogIssueHasPendingReviewPath(watchdogIssue.companyId, watchdogIssue.id, dbOrTx);
       return isWatchdogReviewDisposition(watchdogIssue, hasPendingReviewPath);
     }
     return true;
@@ -1529,7 +1530,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .then((rows) => rows[0] ?? null)
       : null;
-    if (existingWatchdogIssue?.status === "in_review" && isWatchdogReviewDisposition(
+    if (existingWatchdogIssue?.status === "in_review" &&
+      fingerprintConfigurationRevision(existingWatchdogIssue.originFingerprint ?? "") !== watchdog.configurationRevision &&
+      isWatchdogReviewDisposition(
       existingWatchdogIssue,
       await watchdogIssueHasPendingReviewPath(watchdog.companyId, existingWatchdogIssue.id),
     )) {
@@ -1576,13 +1579,14 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       if (review && await hasLivePathForIssue(watchdog.companyId, review.id, tx)) {
         return { state: "watchdog_live" as const, watchdogIssueId: review.id };
       }
-      if (review?.status === "in_review" && isWatchdogReviewDisposition(
+      if (review?.status === "in_review" &&
+        fingerprintConfigurationRevision(review.originFingerprint ?? "") !== watchdog.configurationRevision &&
+        isWatchdogReviewDisposition(
         review, await watchdogIssueHasPendingReviewPath(watchdog.companyId, review.id, tx),
       )) {
         return { state: "watchdog_review_open" as const, watchdogIssueId: review.id };
       }
-      if (review?.originFingerprint === classification.stopFingerprint &&
-        !isTerminalIssueStatus(review.status) && review.status !== "backlog" && review.status !== "in_review") {
+      if (await sameFingerprintWatchdogReviewIsStillOpen(review, classification.stopFingerprint, tx)) {
         return { state: "watchdog_review_open" as const, watchdogIssueId: review.id };
       }
       const watchdogIssue = await ensureReusableWatchdogIssue({
