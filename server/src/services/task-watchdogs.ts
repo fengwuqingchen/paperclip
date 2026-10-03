@@ -101,6 +101,7 @@ export type TaskWatchdogClassifierConfig = Pick<
   IssueWatchdogSummary,
   "companyId" | "issueId" | "lastReviewedFingerprint"
 > & {
+  configurationRevision?: number;
   lastReviewedStopSnapshot?: TaskWatchdogStopSnapshot | null;
 };
 
@@ -138,6 +139,7 @@ export type TaskWatchdogWaitsByIssueId = Record<string, {
 
 export type TaskWatchdogStopSnapshot = {
   version: 2;
+  configurationRevision?: number;
   fingerprint: string;
   materialLeaves: TaskWatchdogMaterialLeaf[];
   waitsByIssueId: TaskWatchdogWaitsByIssueId;
@@ -304,6 +306,7 @@ function waitingPathIds(
 function stableStopFingerprint(input: {
   companyId: string;
   watchedIssueId: string;
+  configurationRevision: number;
   materialLeaves: TaskWatchdogMaterialLeaf[];
   waitsByIssueId: TaskWatchdogWaitsByIssueId;
 }) {
@@ -313,8 +316,15 @@ function stableStopFingerprint(input: {
     watchedIssueId: input.watchedIssueId,
     materialLeaves: input.materialLeaves,
     waitsByIssueId: input.waitsByIssueId,
+    ...(input.configurationRevision > 0 ? { configurationRevision: input.configurationRevision } : {}),
   });
-  return `task_watchdog_stop:${createHash("sha256").update(payload).digest("hex")}`;
+  const revisionTag = input.configurationRevision > 0 ? `:config:${input.configurationRevision}` : "";
+  return `task_watchdog_stop:${createHash("sha256").update(payload).digest("hex")}${revisionTag}`;
+}
+
+function fingerprintConfigurationRevision(fingerprint: string) {
+  const revisionTag = fingerprint.match(/:config:(\d+)$/);
+  return revisionTag ? Number(revisionTag[1]) : 0;
 }
 
 function materialLeaf(leaf: TaskWatchdogStoppedLeaf): TaskWatchdogMaterialLeaf {
@@ -339,6 +349,11 @@ function parseStopSnapshot(value: unknown): TaskWatchdogStopSnapshot | null {
     !candidate.waitsByIssueId ||
     typeof candidate.waitsByIssueId !== "object"
   ) return null;
+  if (candidate.configurationRevision !== undefined && (
+    !Number.isSafeInteger(candidate.configurationRevision) ||
+    candidate.configurationRevision < 0 ||
+    candidate.configurationRevision !== fingerprintConfigurationRevision(candidate.fingerprint)
+  )) return null;
   return candidate as TaskWatchdogStopSnapshot;
 }
 
@@ -360,7 +375,9 @@ function isShrinkOfReviewedSnapshot(
   current: TaskWatchdogStopSnapshot,
   reviewed: TaskWatchdogStopSnapshot | null | undefined,
 ) {
-  if (!reviewed || canonicalJson(current.waitsByIssueId) !== canonicalJson(reviewed.waitsByIssueId)) return false;
+  if (!reviewed ||
+    fingerprintConfigurationRevision(current.fingerprint) !== fingerprintConfigurationRevision(reviewed.fingerprint) ||
+    canonicalJson(current.waitsByIssueId) !== canonicalJson(reviewed.waitsByIssueId)) return false;
   const reviewedLeaves = new Map(reviewed.materialLeaves.map((leaf) => [leaf.issueId, leaf]));
   return current.materialLeaves.every((leaf) => {
     const previous = reviewedLeaves.get(leaf.issueId);
@@ -507,12 +524,15 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const stopFingerprint = stableStopFingerprint({
     companyId: input.watchdog.companyId,
     watchedIssueId: input.watchdog.issueId,
+    configurationRevision: input.watchdog.configurationRevision ?? 0,
     materialLeaves,
     waitsByIssueId,
   });
   const currentStopSnapshot: TaskWatchdogStopSnapshot = {
     version: 2,
     fingerprint: stopFingerprint,
+    ...((input.watchdog.configurationRevision ?? 0) > 0
+      ? { configurationRevision: input.watchdog.configurationRevision } : {}),
     materialLeaves,
     waitsByIssueId,
   };
@@ -787,11 +807,23 @@ async function updateIssueWatchdogRow(
   input: IssueWatchdogUpsertInput,
   now: Date,
 ) {
+  const instructions = normalizeInstructions(input.instructions);
+  // Evaluate the change against the locked row at UPDATE time, rather than
+  // the earlier SELECT. Concurrent saves must not lose a configuration epoch.
+  const changed = sql`(${issueWatchdogs.watchdogAgentId} IS DISTINCT FROM ${input.agentId}::uuid
+    OR ${issueWatchdogs.instructions} IS DISTINCT FROM ${instructions}::text
+    OR ${issueWatchdogs.status} <> 'active')`;
   const [updated] = await dbOrTx
     .update(issueWatchdogs)
     .set({
       watchdogAgentId: input.agentId,
-      instructions: normalizeInstructions(input.instructions),
+      instructions,
+      configurationRevision: sql`CASE WHEN ${changed} THEN ${issueWatchdogs.configurationRevision} + 1 ELSE ${issueWatchdogs.configurationRevision} END`,
+      lastObservedFingerprint: sql`CASE WHEN ${changed} THEN NULL ELSE ${issueWatchdogs.lastObservedFingerprint} END`,
+      lastObservedStopSnapshot: sql`CASE WHEN ${changed} THEN NULL ELSE ${issueWatchdogs.lastObservedStopSnapshot} END`,
+      lastReviewedFingerprint: sql`CASE WHEN ${changed} THEN NULL ELSE ${issueWatchdogs.lastReviewedFingerprint} END`,
+      lastReviewedStopSnapshot: sql`CASE WHEN ${changed} THEN NULL ELSE ${issueWatchdogs.lastReviewedStopSnapshot} END`,
+      lastCompletedAt: sql`CASE WHEN ${changed} THEN NULL ELSE ${issueWatchdogs.lastCompletedAt} END`,
       status: "active",
       updatedByAgentId: input.actor?.agentId ?? null,
       updatedByUserId: input.actor?.userId ?? null,
@@ -1095,6 +1127,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     return {
       watchdog: {
         ...summarizeIssueWatchdog(watchdog),
+        configurationRevision: watchdog.configurationRevision,
         lastReviewedStopSnapshot: parseStopSnapshot(watchdog.lastReviewedStopSnapshot),
       },
       issues: issueRows.map((issue) => ({
@@ -1280,6 +1313,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (!isWatchdogReviewDisposition(watchdogIssue, hasPendingReviewPath)) return watchdog;
     const reviewedFingerprint = reviewedFingerprintForWatchdogIssue(watchdogIssue);
     if (!reviewedFingerprint) return watchdog;
+    if (fingerprintConfigurationRevision(reviewedFingerprint) !== (watchdog.configurationRevision ?? 0)) return watchdog;
     const observedSnapshot = parseStopSnapshot(watchdog.lastObservedStopSnapshot);
     const reviewedStopSnapshot = observedSnapshot?.fingerprint === reviewedFingerprint
       ? observedSnapshot
@@ -1296,8 +1330,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         lastCompletedAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(issueWatchdogs.id, watchdog.id))
+      .where(and(
+        eq(issueWatchdogs.id, watchdog.id),
+        eq(issueWatchdogs.configurationRevision, watchdog.configurationRevision ?? 0),
+        eq(issueWatchdogs.status, "active"),
+      ))
       .returning();
+    if (!updated) return watchdog;
     await logActivity(db, {
       companyId: watchdog.companyId,
       actorType: "system",
@@ -1342,11 +1381,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (fallback) {
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
+        fingerprintConfigurationRevision(fallback.originFingerprint ?? "") !== (input.watchdog.configurationRevision ?? 0) ||
         await watchdogIssueNeedsFreshWake(fallback);
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
           status: "todo",
           assigneeAgentId: input.watchdog.watchdogAgentId,
+          assigneeUserId: null,
           parentId: input.sourceIssue.id,
           projectId: input.sourceIssue.projectId,
           goalId: input.sourceIssue.goalId,
@@ -1465,7 +1506,11 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           lastObservedStopSnapshot: classification.stopSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(issueWatchdogs.id, watchdog.id));
+        .where(and(
+          eq(issueWatchdogs.id, watchdog.id),
+          eq(issueWatchdogs.configurationRevision, watchdog.configurationRevision ?? 0),
+          eq(issueWatchdogs.status, "active"),
+        ));
       return { state: "watchdog_live" as const, classification, watchdogIssueId: existingWatchdogIssueId };
     }
     const existingWatchdogIssue = existingWatchdogIssueId
@@ -1493,7 +1538,11 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
             lastObservedStopSnapshot: classification.stopSnapshot,
             updatedAt: new Date(),
           })
-          .where(eq(issueWatchdogs.id, watchdog.id));
+          .where(and(
+            eq(issueWatchdogs.id, watchdog.id),
+            eq(issueWatchdogs.configurationRevision, watchdog.configurationRevision ?? 0),
+            eq(issueWatchdogs.status, "active"),
+          ));
       }
       return {
         state: "watchdog_review_open" as const,
@@ -1509,7 +1558,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       runId: opts.runId ?? null,
     });
     const now = new Date();
-    await db
+    const [claimed] = await db
       .update(issueWatchdogs)
       .set({
         watchdogIssueId: watchdogIssue.id,
@@ -1519,7 +1568,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         triggerCount: sql`${issueWatchdogs.triggerCount} + 1`,
         updatedAt: now,
       })
-      .where(eq(issueWatchdogs.id, watchdog.id));
+      .where(and(
+        eq(issueWatchdogs.id, watchdog.id),
+        eq(issueWatchdogs.configurationRevision, watchdog.configurationRevision ?? 0),
+        eq(issueWatchdogs.status, "active"),
+      ))
+      .returning({ id: issueWatchdogs.id });
+    if (!claimed) return { state: "configuration_changed" as const, classification };
 
     await logActivity(db, {
       companyId: sourceIssue.companyId,
@@ -1645,6 +1700,16 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
     const classification = classifyTaskWatchdogSubtree(input);
     if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
+      const current = await db.select({ id: issueWatchdogs.id }).from(issueWatchdogs).where(and(
+        eq(issueWatchdogs.id, watchdog.id),
+        eq(issueWatchdogs.configurationRevision, watchdog.configurationRevision ?? 0),
+        eq(issueWatchdogs.status, "active"),
+      )).then((rows) => rows[0] ?? null);
+      if (!current) return {
+        allowed: false as const,
+        reason: "Task-watchdog configuration changed during mutation revalidation.",
+        classification,
+      };
       return { allowed: true as const, classification };
     }
 
