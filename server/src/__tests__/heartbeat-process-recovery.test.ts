@@ -2704,6 +2704,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("returns a never-started native run to the queue when shutdown wins at dispatch", async () => {
+    await withTempPaperclipHome(async () => {
+      const { agentId, issueId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+      await db.update(agents).set({ adapterType: "paperclip_runner",
+        adapterConfig: { provider: "codex", model: "gpt-5.6-luna" },
+      }).where(eq(agents.id, agentId));
+      await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, runId));
+      const factory = vi.fn(() => { throw new NativeRunnerOwnershipUnverifiedError(); });
+      let reachedDispatch = false;
+      const heartbeat = heartbeatService(db, {
+        nativeSessionBackendFactory: factory,
+        beforeChatControlRecoveryCheck: async ({ stage, runId: id }) => {
+          if (stage !== "dispatch") return;
+          reachedDispatch = true;
+          expect((await heartbeat.getRun(id))?.runtimeMode).toBe("native");
+          heartbeat.closeRunAdmissionForShutdown();
+        },
+      });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(reachedDispatch).toBe(true);
+      expect(factory).not.toHaveBeenCalled();
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "queued",
+        processPid: null, processGroupId: null, startedAt: null, errorCode: null,
+      });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(wake).toMatchObject({ status: "queued", claimedAt: null });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue.executionRunId).toBeNull();
+      // The fresh lifetime reaches provider handoff for this same run. No
+      // restart checkpoint is needed because the first runner never started.
+      const nextDb = createDb(externalTestDatabaseUrl ?? tempDb!.connectionString);
+      const nextServer = heartbeatService(nextDb, { nativeSessionBackendFactory: factory });
+      await nextServer.resumeQueuedRuns();
+      await nextServer.drainActiveRunExecutions();
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(await nextServer.getRun(runId)).toMatchObject({ status: "running", runtimeMode: "native",
+        errorCode: "native_execution_ownership_unverified" });
+    });
+  });
+
+  it("preserves an existing native process when shutdown closes admission", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId, issueId, wakeupRequestId } = await seedRunFixture({
+      runtimeMode: "native", processPid: child.pid!, agentStatus: "running",
+    });
+    const heartbeat = heartbeatService(db);
+    heartbeat.closeRunAdmissionForShutdown();
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(isPidAlive(child.pid!)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "running", runtimeMode: "native", processPid: child.pid,
+    });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    expect(wake.status).toBe("claimed");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.executionRunId).toBe(runId);
+  });
+
   it("dispatches local native external chat inside the server-selected task root", async () => {
     await withTempPaperclipHome(async () => {
       const { companyId, agentId, issueId, runId } =

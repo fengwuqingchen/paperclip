@@ -20343,6 +20343,7 @@ export function heartbeatService(
 
     let legacyAdapterEntered = false;
     let shutdownClaimReleasePending = false;
+    let nativeShutdownRequiresRestartRecovery = false;
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -22772,7 +22773,7 @@ export function heartbeatService(
         // Selected native state can retain a runner from an earlier turn.
         // Preserve its existing restart ownership path instead of requeueing it
         // on the assumption that no managed process exists.
-        if (runtimeMode === "native") {
+        if (runtimeMode === "native" && nativeShutdownRequiresRestartRecovery) {
           throw new NativeControllerDetachedForRestartError();
         }
         throw new ShutdownAdmissionClosedError();
@@ -24206,6 +24207,19 @@ export function heartbeatService(
             }
             nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
           }
+          const priorProcess = previousNativeRun?.nativeSessionId === nativeSessionId
+            ? previousNativeRun : null;
+          nativeShutdownRequiresRestartRecovery = Boolean(
+            runOptions.nativeLeaseOwner || runOptions.nativeRestartRecovery ||
+            nativeInstructionReservation ||
+            !isUnusedNativeSessionBootstrap({
+              processPid: run.processPid ?? priorProcess?.processPid ?? null,
+              processGroupId: run.processGroupId ?? priorProcess?.processGroupId ?? null,
+              processStartedAt: run.processStartedAt ?? priorProcess?.processStartedAt ?? null,
+              runnerProfileJson: { ...persistedProfile,
+                sessionCheckpoint: nativeResumeCheckpoint ?? persistedProfile.sessionCheckpoint ?? null },
+            }, nativeBootstrapHasProviderEvidence),
+          );
           const nativeSandboxLifecycle = resolveNativeSandboxLifecycle({
             adapterType: agent.adapterType,
             lifecyclePolicy: nativeExecution.session.lifecyclePolicy,
