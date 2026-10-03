@@ -652,6 +652,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
+    // A shutdown closes the server's Db lifetime permanently. Each case
+    // represents a new server lifetime, even though it reuses the fixture DB.
+    const connectionString = externalTestDatabaseUrl ?? tempDb!.connectionString;
+    await closeRegisteredClients(connectionString);
+    db = createDb(connectionString);
   });
 
   afterAll(async () => {

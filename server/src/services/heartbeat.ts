@@ -1320,6 +1320,10 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
+// The scheduler and HTTP routes construct separate services over the same Db.
+// Closing admission belongs to that server lifetime, not to one service. A new
+// server creates a new Db; no operator action can reopen a closing lifetime.
+const shutdownDatabases = new WeakSet<Db>();
 const nativeSessionResumeDispatchTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
@@ -9554,7 +9558,9 @@ export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
 ) {
-  let shutdownInProgress = false;
+  const closeRunAdmissionForShutdown = () => {
+    shutdownDatabases.add(db);
+  };
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -9609,9 +9615,18 @@ export function heartbeatService(
   };
   const getSchedulingSuppression = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
-    return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
+    const suppression = resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
     });
+    // Preserve quarantine policies that skip requests instead of queueing them.
+    if (suppression.suppressed && suppression.reason !== "task_drain") {
+      return suppression;
+    }
+    // Read the shared hold after the asynchronous settings lookup as well.
+    if (shutdownDatabases.has(db)) {
+      return { suppressed: true, reason: "server_shutdown" as const };
+    }
+    return suppression;
   };
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
@@ -14600,7 +14615,7 @@ export function heartbeatService(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
   ) {
-    shutdownInProgress = true;
+    closeRunAdmissionForShutdown();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -15198,6 +15213,7 @@ export function heartbeatService(
     now = new Date(),
     runIds: readonly string[] | null = null,
   ) {
+    closeRunAdmissionForShutdown();
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
       return {
@@ -26782,7 +26798,7 @@ export function heartbeatService(
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
-        !shutdownInProgress
+        !shutdownDatabases.has(db)
       ) {
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
@@ -27069,7 +27085,7 @@ export function heartbeatService(
     };
 
     const schedulingSuppression = await getSchedulingSuppression();
-    // A task drain holds ADMISSION, not the request. The drain is a
+    // Task-drain and shutdown holds block ADMISSION, not the request. A hold is a
     // process-local pre-restart hold, so a wake that arrives while it is
     // active still names real work that must run once the process comes
     // back: leave it in the durable queue and let the dispatch-side checks
@@ -27080,7 +27096,8 @@ export function heartbeatService(
     // run and no path until a person noticed.
     if (
       schedulingSuppression.suppressed &&
-      schedulingSuppression.reason !== "task_drain"
+      schedulingSuppression.reason !== "task_drain" &&
+      schedulingSuppression.reason !== "server_shutdown"
     ) {
       await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
         reason: schedulingSuppression.reason,
@@ -30254,6 +30271,7 @@ export function heartbeatService(
     reportRunActivity: clearDetachedRunWarning,
 
     prepareHotRestartShutdown,
+    closeRunAdmissionForShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
